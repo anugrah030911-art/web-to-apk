@@ -7,6 +7,7 @@ on:
       app_url: { required: true, type: string }
       app_name: { required: true, type: string }
       app_id: { required: true, type: string }
+      app_icon: { required: false, type: string, default: "" }
 permissions:
   contents: write
 jobs:
@@ -16,6 +17,7 @@ jobs:
       APP_URL: ${{ inputs.app_url }}
       APP_NAME: ${{ inputs.app_name }}
       APP_ID: ${{ inputs.app_id }}
+      APP_ICON: ${{ inputs.app_icon }}
     steps:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -31,6 +33,36 @@ jobs:
             '{appId:$id, appName:$name, webDir:"www", server:{url:$url, androidScheme:"https"}}' \
             > capacitor.config.json
           npx cap add android
+          if [ -n "$APP_ICON" ]; then
+            python3 -m pip install Pillow
+            python3 - <<'PY'
+          import os, base64, io
+          from pathlib import Path
+          from PIL import Image
+          icon = Image.open(io.BytesIO(base64.b64decode(os.environ['APP_ICON'], validate=True))).convert('RGBA')
+          res = Path('android/app/src/main/res')
+          for density, size in [('mdpi',48), ('hdpi',72), ('xhdpi',96), ('xxhdpi',144), ('xxxhdpi',192)]:
+              folder = res / ('mipmap-' + density)
+              folder.mkdir(parents=True, exist_ok=True)
+              for name in ['ic_launcher', 'ic_launcher_round', 'ic_launcher_foreground']:
+                  for old in folder.glob(name + '.*'):
+                      old.unlink()
+              image = icon.resize((size, size), Image.Resampling.LANCZOS)
+              image.save(folder / 'ic_launcher.png')
+              image.save(folder / 'ic_launcher_round.png')
+              foreground_size = round(size * 108 / 48)
+              mark_size = round(size * 66 / 48)
+              foreground = Image.new('RGBA', (foreground_size, foreground_size))
+              mark = icon.resize((mark_size, mark_size), Image.Resampling.LANCZOS)
+              offset = (foreground_size - mark_size) // 2
+              foreground.paste(mark, (offset, offset), mark)
+              foreground.save(folder / 'ic_launcher_foreground.png')
+          adaptive = '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android"><background android:drawable="@android:color/white"/><foreground android:drawable="@mipmap/ic_launcher_foreground"/></adaptive-icon>'
+          for folder in res.glob('mipmap-anydpi*'):
+              for name in ['ic_launcher.xml', 'ic_launcher_round.xml']:
+                  (folder / name).write_text(adaptive)
+          PY
+          fi
           cd android && chmod +x gradlew && ./gradlew assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/app.apk"
       - uses: softprops/action-gh-release@v2
