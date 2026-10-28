@@ -8,6 +8,10 @@ on:
       app_name: { required: true, type: string }
       app_id: { required: true, type: string }
       app_icon: { required: false, type: string, default: "" }
+      welcome_text: { required: false, type: string, default: "" }
+      opening_image: { required: false, type: string, default: "" }
+      show_loading: { required: false, type: string, default: "false" }
+      pull_to_refresh: { required: false, type: string, default: "false" }
 permissions:
   contents: write
 jobs:
@@ -18,6 +22,10 @@ jobs:
       APP_NAME: ${{ inputs.app_name }}
       APP_ID: ${{ inputs.app_id }}
       APP_ICON: ${{ inputs.app_icon }}
+      WELCOME_TEXT: ${{ inputs.welcome_text }}
+      OPENING_IMAGE: ${{ inputs.opening_image }}
+      SHOW_LOADING: ${{ inputs.show_loading }}
+      PULL_TO_REFRESH: ${{ inputs.pull_to_refresh }}
     steps:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -33,6 +41,7 @@ jobs:
             '{appId:$id, appName:$name, webDir:"www", server:{url:$url, androidScheme:"https"}}' \
             > capacitor.config.json
           npx cap add android
+          python3 -m pip install Pillow
           if [ -n "$APP_ICON" ]; then
             python3 -m pip install Pillow
             python3 - <<'PY'
@@ -63,6 +72,133 @@ jobs:
                   (folder / name).write_text(adaptive)
           PY
           fi
+          python3 - <<'PY'
+          import os, base64, json
+          from pathlib import Path
+          from PIL import Image
+          import io
+          
+          root = Path('android/app/src/main')
+          assets = root / 'assets'
+          assets.mkdir(parents=True, exist_ok=True)
+          welcome = os.environ.get('WELCOME_TEXT', '')
+          opening = os.environ.get('OPENING_IMAGE', '')
+          if opening:
+              image = Image.open(io.BytesIO(base64.b64decode(opening, validate=True)))
+              image.thumbnail((640, 640))
+              image.convert('RGB').save(assets / 'opening.jpg', quality=85)
+          (assets / 'experience.json').write_text(json.dumps({
+              'welcome': welcome, 'image': bool(opening),
+              'loading': os.environ.get('SHOW_LOADING') == 'true',
+              'refresh': os.environ.get('PULL_TO_REFRESH') == 'true'
+          }))
+          package = os.environ['APP_ID']
+          java = root / 'java' / Path(package.replace('.', '/')) / 'MainActivity.java'
+          java.write_text('package ' + package + ';\n' + r'''
+          import android.os.Bundle;
+          import android.graphics.Color;
+          import android.graphics.BitmapFactory;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.webkit.WebView;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceError;
+          import android.widget.*;
+          import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
+          import com.getcapacitor.BridgeActivity;
+          import com.getcapacitor.BridgeWebViewClient;
+          import org.json.JSONObject;
+          import java.io.InputStream;
+          
+          public class MainActivity extends BridgeActivity {
+            private SwipeRefreshLayout refresh;
+            private ProgressBar loading;
+            private boolean loadingEnabled;
+            @Override public void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              if (getBridge() == null || getBridge().getWebView() == null) return;
+              try {
+                JSONObject config;
+                try (InputStream in = getAssets().open("experience.json")) {
+                  config = new JSONObject(new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+                }
+                WebView web = getBridge().getWebView();
+                ViewGroup parent = (ViewGroup) web.getParent();
+                int index = parent.indexOfChild(web);
+                ViewGroup.LayoutParams oldParams = web.getLayoutParams();
+                parent.removeView(web);
+                FrameLayout frame = new FrameLayout(this);
+                parent.addView(frame, index, oldParams);
+                refresh = new SwipeRefreshLayout(this);
+                refresh.setEnabled(config.optBoolean("refresh"));
+                refresh.addView(web, new ViewGroup.LayoutParams(-1, -1));
+                frame.addView(refresh, new FrameLayout.LayoutParams(-1, -1));
+                refresh.setOnChildScrollUpCallback((layout, child) -> web.canScrollVertically(-1));
+                refresh.setOnRefreshListener(() -> { web.reload(); refresh.postDelayed(() -> refresh.setRefreshing(false), 30000); });
+                loadingEnabled = config.optBoolean("loading");
+                loading = new ProgressBar(this);
+                FrameLayout.LayoutParams spinner = new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER);
+                frame.addView(loading, spinner);
+                loading.setVisibility(loadingEnabled && web.getProgress() < 100 ? View.VISIBLE : View.GONE);
+                web.setWebViewClient(new BridgeWebViewClient(getBridge()) {
+                  @Override public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                    super.onPageStarted(view, url, favicon);
+                    if (loadingEnabled) loading.setVisibility(View.VISIBLE);
+                    loading.postDelayed(() -> finishLoading(), 30000);
+                  }
+                  @Override public void onPageFinished(WebView view, String url) {
+                    super.onPageFinished(view, url);
+                    finishLoading();
+                  }
+                  @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                    super.onReceivedError(view, request, error);
+                    if (request.isForMainFrame()) finishLoading();
+                  }
+                });
+                String welcome = config.optString("welcome");
+                if (!welcome.isEmpty() || config.optBoolean("image")) {
+                  LinearLayout content = new LinearLayout(this);
+                  content.setOrientation(LinearLayout.VERTICAL);
+                  content.setGravity(Gravity.CENTER);
+                  content.setPadding(dp(24), dp(24), dp(24), dp(24));
+                  if (config.optBoolean("image")) {
+                    ImageView image = new ImageView(this);
+                    try (InputStream in = getAssets().open("opening.jpg")) { image.setImageBitmap(BitmapFactory.decodeStream(in)); }
+                    image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                    content.addView(image, new LinearLayout.LayoutParams(-1, dp(240)));
+                  }
+                  if (!welcome.isEmpty()) {
+                    TextView text = new TextView(this);
+                    text.setText(welcome);
+                    text.setTextSize(24);
+                    text.setTextColor(Color.BLACK);
+                    text.setGravity(Gravity.CENTER);
+                    text.setPadding(0, dp(20), 0, dp(20));
+                    content.addView(text, new LinearLayout.LayoutParams(-1, -2));
+                  }
+                  ScrollView openingView = new ScrollView(this);
+                  openingView.setFillViewport(true);
+                  openingView.setBackgroundColor(Color.WHITE);
+                  openingView.addView(content, new ScrollView.LayoutParams(-1, -2));
+                  Button enter = new Button(this);
+                  enter.setText("Mulai");
+                  enter.setOnClickListener(v -> frame.removeView(openingView));
+                  content.addView(enter, new LinearLayout.LayoutParams(-1, -2));
+                  frame.addView(openingView, new FrameLayout.LayoutParams(-1, -1));
+                }
+              } catch (Exception error) { android.util.Log.e("WebToApk", "Opening setup failed", error); }
+            }
+            private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
+            private void finishLoading() {
+              if (loading != null) loading.setVisibility(View.GONE);
+              if (refresh != null) refresh.setRefreshing(false);
+            }
+          }
+          ''')
+          gradle = Path('android/app/build.gradle')
+          gradle.write_text(gradle.read_text() + "\ndependencies { implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0' }\n")
+          PY
           cd android && chmod +x gradlew && ./gradlew assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/app.apk"
       - uses: softprops/action-gh-release@v2
